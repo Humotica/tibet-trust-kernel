@@ -2,7 +2,9 @@ use std::time::Instant;
 use std::fs;
 use std::io::Write;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Serialize, Deserialize};
+use rayon::prelude::*;
 
 // Echte crypto — AES-NI hardware accelerated
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -805,6 +807,212 @@ impl AirlockBifurcation {
     /// Statistieken opvragen.
     pub fn stats(&self) -> &BifurcationStats {
         &self.stats
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Parallel Batch Operations — Multi-Core Sealing & Opening
+//
+// Elke core pakt een block, maakt eigen ephemeral keypair,
+// eigen AES-GCM instance. Geen gedeelde mutable state.
+// Op 12-core P520: theoretisch 12x throughput → 3+ GB/s
+// ═══════════════════════════════════════════════════════════════
+
+/// Resultaat van een parallel batch operatie.
+#[derive(Debug)]
+pub struct BatchResult {
+    /// Succesvol verwerkte blocks
+    pub blocks: Vec<EncryptedBlock>,
+    /// Totale doorlooptijd in microseconden
+    pub total_us: u64,
+    /// Gemiddelde tijd per block in microseconden
+    pub per_block_us: u64,
+    /// Throughput in MB/s
+    pub throughput_mbs: f64,
+    /// Aantal gebruikte threads (rayon)
+    pub threads_used: usize,
+}
+
+/// Resultaat van een parallel open operatie.
+#[derive(Debug)]
+pub struct BatchOpenResult {
+    /// Succesvol ontsleutelde plaintexts
+    pub plaintexts: Vec<Vec<u8>>,
+    /// Aantal geweigerd (clearance te laag)
+    pub denied: u64,
+    /// Totale doorlooptijd in microseconden
+    pub total_us: u64,
+    /// Gemiddelde tijd per block in microseconden
+    pub per_block_us: u64,
+    /// Throughput in MB/s
+    pub throughput_mbs: f64,
+}
+
+/// Parallel seal: versleutel meerdere blocks tegelijk over alle CPU cores.
+///
+/// Elke core krijgt:
+///   - Eigen ephemeral X25519 keypair (geen sharing)
+///   - Eigen AES-GCM cipher instance
+///   - Eigen RDRAND nonce (per-core hardware random)
+///
+/// Geen locks, geen mutexes, pure data-parallel.
+pub fn parallel_seal(
+    plaintexts: &[Vec<u8>],
+    system_secret: &[u8; 32],
+    required_clearance: ClearanceLevel,
+    encrypted_by: &str,
+) -> BatchResult {
+    let t0 = Instant::now();
+
+    // System public key afleiden (eenmalig)
+    let system_static = StaticSecret::from(*system_secret);
+    let system_pub = PublicKey::from(&system_static);
+    let system_pub_bytes = system_pub.to_bytes();
+    let encrypted_by = encrypted_by.to_string();
+    let blocks_sealed = AtomicU64::new(0);
+
+    // Rayon parallel iterator — elke core pakt een block
+    let blocks: Vec<EncryptedBlock> = plaintexts
+        .par_iter()
+        .enumerate()
+        .map(|(block_index, plaintext)| {
+            // Per-thread: eigen ephemeral keypair
+            let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
+            let ephemeral_pub = PublicKey::from(&ephemeral_secret);
+
+            // DH: ephemeral × system_pub
+            let system_pub_key = PublicKey::from(system_pub_bytes);
+            let shared = ephemeral_secret.diffie_hellman(&system_pub_key);
+
+            // HKDF per-block key
+            let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+            let mut info = Vec::from(HKDF_INFO_PREFIX);
+            info.extend_from_slice(&block_index.to_le_bytes());
+            let mut aes_key = [0u8; AES_KEY_SIZE];
+            hk.expand(&info, &mut aes_key).expect("HKDF expand failed");
+
+            // Nonce via RDRAND
+            let nonce = rdrand_nonce();
+
+            // SHA-256 plaintext hash
+            let mut hasher = Sha256::new();
+            hasher.update(plaintext);
+            let hash_result = hasher.finalize();
+            let mut plaintext_hash = [0u8; 32];
+            plaintext_hash.copy_from_slice(&hash_result);
+
+            // AES-256-GCM encrypt
+            let cipher_key = Key::<Aes256Gcm>::from_slice(&aes_key);
+            let cipher = Aes256Gcm::new(cipher_key);
+            let nonce_obj = Nonce::from_slice(&nonce);
+            let ciphertext = cipher.encrypt(nonce_obj, plaintext.as_ref())
+                .expect("AES-256-GCM encrypt failed");
+
+            blocks_sealed.fetch_add(1, Ordering::Relaxed);
+
+            EncryptedBlock {
+                block_index,
+                ephemeral_pub: ephemeral_pub.to_bytes(),
+                nonce,
+                required_clearance,
+                plaintext_hash,
+                ciphertext,
+                encrypted_at_ns: t0.elapsed().as_nanos() as u64,
+                encrypted_by: encrypted_by.clone(),
+            }
+        })
+        .collect();
+
+    let total_us = t0.elapsed().as_micros() as u64;
+    let total_bytes: usize = plaintexts.iter().map(|p| p.len()).sum();
+    let count = blocks.len().max(1);
+
+    BatchResult {
+        blocks,
+        total_us,
+        per_block_us: total_us / count as u64,
+        throughput_mbs: (total_bytes as f64) / (total_us as f64 / 1_000_000.0) / (1024.0 * 1024.0),
+        threads_used: rayon::current_num_threads(),
+    }
+}
+
+/// Parallel open: ontsleutel meerdere blocks tegelijk met dezelfde JIS claim.
+///
+/// Clearance check per block, dan parallel decrypt.
+/// Geweigerde blocks worden overgeslagen (niet gedecrypt).
+pub fn parallel_open(
+    blocks: &[EncryptedBlock],
+    claim: &JisClaim,
+    system_secret: &[u8; 32],
+) -> BatchOpenResult {
+    let t0 = Instant::now();
+    let denied = AtomicU64::new(0);
+
+    // Valideer claim eenmalig (niet per thread)
+    if claim.identity.is_empty() || claim.ed25519_pub.len() != ED25519_PUB_SIZE * 2 {
+        return BatchOpenResult {
+            plaintexts: vec![],
+            denied: blocks.len() as u64,
+            total_us: 0,
+            per_block_us: 0,
+            throughput_mbs: 0.0,
+        };
+    }
+
+    let results: Vec<Option<Vec<u8>>> = blocks
+        .par_iter()
+        .map(|block| {
+            // Clearance check
+            if claim.clearance < block.required_clearance {
+                denied.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+
+            // DH: system_secret × ephemeral_pub
+            let system_static = StaticSecret::from(*system_secret);
+            let ephemeral_pub = PublicKey::from(block.ephemeral_pub);
+            let shared = system_static.diffie_hellman(&ephemeral_pub);
+
+            // HKDF per-block key
+            let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+            let mut info = Vec::from(HKDF_INFO_PREFIX);
+            info.extend_from_slice(&block.block_index.to_le_bytes());
+            let mut aes_key = [0u8; AES_KEY_SIZE];
+            hk.expand(&info, &mut aes_key).expect("HKDF expand failed");
+
+            // AES-256-GCM decrypt
+            let cipher_key = Key::<Aes256Gcm>::from_slice(&aes_key);
+            let cipher = Aes256Gcm::new(cipher_key);
+            let nonce = Nonce::from_slice(&block.nonce);
+            let plaintext = cipher.decrypt(nonce, block.ciphertext.as_ref())
+                .expect("AES-256-GCM decrypt failed");
+
+            // Integrity check
+            let mut hasher = Sha256::new();
+            hasher.update(&plaintext);
+            let hash_result = hasher.finalize();
+            let mut actual_hash = [0u8; 32];
+            actual_hash.copy_from_slice(&hash_result);
+
+            if actual_hash != block.plaintext_hash {
+                return None;
+            }
+
+            Some(plaintext)
+        })
+        .collect();
+
+    let plaintexts: Vec<Vec<u8>> = results.into_iter().flatten().collect();
+    let total_us = t0.elapsed().as_micros() as u64;
+    let total_bytes: usize = plaintexts.iter().map(|p| p.len()).sum();
+    let count = blocks.len().max(1);
+
+    BatchOpenResult {
+        plaintexts,
+        denied: denied.load(Ordering::Relaxed),
+        total_us,
+        per_block_us: total_us / count as u64,
+        throughput_mbs: (total_bytes as f64) / (total_us.max(1) as f64 / 1_000_000.0) / (1024.0 * 1024.0),
     }
 }
 

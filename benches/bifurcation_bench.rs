@@ -399,8 +399,93 @@ fn main() {
         println!();
     }
 
+    // ── Part 9: Multi-Core Parallel Seal — Von Braun Mode 🚀 ──
+    {
+        println!("── Part 9: Multi-Core Parallel Seal — Von Braun Mode ──");
+        let system_secret = b"TIBET-BIFURCATION-SYSTEM-KEY-V01";
+        let mut secret_bytes = [0u8; 32];
+        secret_bytes.copy_from_slice(system_secret);
+
+        let num_threads = rayon::current_num_threads();
+        println!("  CPU cores: {} threads beschikbaar\n", num_threads);
+
+        // Test met verschillende block sizes
+        for &(block_size, block_count) in &[
+            (4096usize, 10_000usize),     // 4KB × 10K = 40MB
+            (16384, 4_000),                // 16KB × 4K = 64MB
+            (65536, 1_000),                // 64KB × 1K = 64MB
+        ] {
+            let plaintexts: Vec<Vec<u8>> = (0..block_count)
+                .map(|_| vec![0x42u8; block_size])
+                .collect();
+
+            // Single-threaded baseline
+            let mut engine = AirlockBifurcation::new();
+            let t0 = Instant::now();
+            for (i, pt) in plaintexts.iter().enumerate() {
+                let _ = engine.seal(pt, i, ClearanceLevel::Confidential, "bench");
+            }
+            let single_us = t0.elapsed().as_micros() as u64;
+            let single_mbs = (block_count as f64 * block_size as f64) / (single_us as f64 / 1_000_000.0) / (1024.0 * 1024.0);
+
+            // Multi-core parallel
+            let result = parallel_seal(
+                &plaintexts,
+                &secret_bytes,
+                ClearanceLevel::Confidential,
+                "bench-parallel",
+            );
+
+            let speedup = single_us as f64 / result.total_us.max(1) as f64;
+
+            println!("  {}KB × {} blocks ({} MB):",
+                block_size / 1024,
+                block_count,
+                block_count * block_size / (1024 * 1024));
+            println!("    Single-thread: {:>8} µs  ({:>7.1} MB/s)",
+                single_us, single_mbs);
+            println!("    Multi-core:    {:>8} µs  ({:>7.1} MB/s)  {} threads",
+                result.total_us, result.throughput_mbs, result.threads_used);
+            println!("    Speedup:       {:.1}x", speedup);
+            println!();
+        }
+
+        // Parallel open test
+        println!("  Parallel Open (4KB × 1000 blocks):");
+        let plaintexts: Vec<Vec<u8>> = (0..1000)
+            .map(|_| vec![0xAB; 4096])
+            .collect();
+
+        let seal_result = parallel_seal(
+            &plaintexts,
+            &secret_bytes,
+            ClearanceLevel::Confidential,
+            "bench-parallel",
+        );
+
+        let claim = make_test_claim(ClearanceLevel::TopSecret);
+
+        let open_result = parallel_open(
+            &seal_result.blocks,
+            &claim,
+            &secret_bytes,
+        );
+
+        println!("    Sealed:     {} blocks in {} µs", seal_result.blocks.len(), seal_result.total_us);
+        println!("    Opened:     {} blocks in {} µs", open_result.plaintexts.len(), open_result.total_us);
+        println!("    Per open:   {} µs", open_result.per_block_us);
+        println!("    Throughput: {:.1} MB/s", open_result.throughput_mbs);
+        println!("    Denied:     {}", open_result.denied);
+
+        // Verify integrity
+        let all_ok = open_result.plaintexts.iter().all(|pt| pt.len() == 4096 && pt[0] == 0xAB);
+        println!("    Integrity:  {}", if all_ok { "✓ alle blocks correct" } else { "✗ FOUT!" });
+        println!();
+    }
+
     println!("═══════════════════════════════════════════════════════════");
-    println!("  Airlock Bifurcatie: encrypt-by-default WERKT.");
+    println!("  Airlock Bifurcatie v2: encrypt-by-default WERKT.");
     println!("  Geen JIS = dood materiaal. Identity IS the key.");
+    println!("  Von Braun Mode: multi-core parallel sealing.");
     println!("═══════════════════════════════════════════════════════════");
 }
