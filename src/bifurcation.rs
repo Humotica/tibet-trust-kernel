@@ -71,15 +71,55 @@ fn rdrand64() -> Option<u64> {
     None
 }
 
-/// Genereer een nonce via RDRAND (hardware) met OsRng fallback.
+/// Genereer 64 bits echte entropy via RDSEED instructie.
+/// RDSEED haalt direct uit de on-die entropy source (trager maar cryptografisch sterker).
+/// Retourneert None als RDSEED faalt of niet beschikbaar.
+#[cfg(target_arch = "x86_64")]
+pub fn rdseed64() -> Option<u64> {
+    if !rdseed_available() {
+        return None;
+    }
+    let mut val: u64;
+    let mut success: u8;
+
+    // Max 10 retries (entropy pool kan tijdelijk leeg zijn)
+    for _ in 0..10 {
+        unsafe {
+            std::arch::asm!(
+                "rdseed {val}",
+                "setc {success}",
+                val = out(reg) val,
+                success = out(reg_byte) success,
+            );
+        }
+        if success == 1 {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Genereer een nonce via de beste beschikbare hardware entropy.
 ///
-/// Probeert eerst RDRAND (0 syscall overhead).
-/// Als RDRAND niet beschikbaar of faalt: fallback naar OsRng.
+/// Prioriteit:
+///   1. RDSEED (echte entropy, cryptografisch sterkst)
+///   2. RDRAND (hardware PRNG, 0 syscalls)
+///   3. OsRng (/dev/urandom fallback)
 pub fn rdrand_nonce() -> [u8; 12] {
     let mut nonce = [0u8; 12];
 
     #[cfg(target_arch = "x86_64")]
     {
+        // Probeer RDSEED eerst (sterkste entropy)
+        if rdseed_available() {
+            if let (Some(a), Some(b)) = (rdseed64(), rdseed64()) {
+                nonce[..8].copy_from_slice(&a.to_le_bytes());
+                nonce[8..].copy_from_slice(&b.to_le_bytes()[..4]);
+                return nonce;
+            }
+        }
+
+        // Fallback: RDRAND (hardware PRNG)
         if let (Some(a), Some(b)) = (rdrand64(), rdrand64()) {
             nonce[..8].copy_from_slice(&a.to_le_bytes());
             nonce[8..].copy_from_slice(&b.to_le_bytes()[..4]);
@@ -87,7 +127,7 @@ pub fn rdrand_nonce() -> [u8; 12] {
         }
     }
 
-    // Fallback: OsRng (syscall naar /dev/urandom)
+    // Laatste fallback: OsRng (syscall naar /dev/urandom)
     rand::Rng::fill(&mut OsRng, &mut nonce);
     nonce
 }
@@ -954,6 +994,200 @@ impl AirlockBifurcation {
     /// Statistieken opvragen.
     pub fn stats(&self) -> &BifurcationStats {
         &self.stats
+    }
+
+    /// Parallel seal: versleutel meerdere blocks over alle CPU cores.
+    /// Session key mode: één DH + parallel HKDF+AES = maximale throughput.
+    /// Stats worden bijgewerkt na afloop.
+    pub fn seal_batch(
+        &mut self,
+        plaintexts: &[Vec<u8>],
+        required_clearance: ClearanceLevel,
+        encrypted_by: &str,
+    ) -> BatchResult {
+        let t0 = Instant::now();
+
+        // Session key aanmaken/hergebruiken (één DH)
+        let needs_new = self.session.as_ref().map_or(true, |s| !s.is_valid());
+        if needs_new {
+            self.session = Some(SessionKey::new(
+                &self.system_pub,
+                100_000,
+                std::time::Duration::from_secs(300),
+            ));
+        }
+
+        let session = self.session.as_ref().unwrap();
+        let shared_secret = session.shared_secret;
+        let ephemeral_pub = session.ephemeral_pub;
+        let encrypted_by = encrypted_by.to_string();
+        let boot_time = self.boot_time;
+        let blocks_sealed = AtomicU64::new(0);
+
+        // Parallel seal met session shared secret
+        let blocks: Vec<EncryptedBlock> = plaintexts
+            .par_iter()
+            .enumerate()
+            .map(|(block_index, plaintext)| {
+                // HKDF per-block key (geen DH!)
+                let hk = Hkdf::<Sha256>::new(None, &shared_secret);
+                let mut info = Vec::from(HKDF_INFO_PREFIX);
+                info.extend_from_slice(&block_index.to_le_bytes());
+                let mut aes_key = [0u8; AES_KEY_SIZE];
+                hk.expand(&info, &mut aes_key).expect("HKDF expand failed");
+
+                // Nonce via RDSEED/RDRAND
+                let nonce = rdrand_nonce();
+
+                // SHA-256 plaintext hash
+                let mut hasher = Sha256::new();
+                hasher.update(plaintext);
+                let hash_result = hasher.finalize();
+                let mut plaintext_hash = [0u8; 32];
+                plaintext_hash.copy_from_slice(&hash_result);
+
+                // AES-256-GCM encrypt
+                let cipher_key = Key::<Aes256Gcm>::from_slice(&aes_key);
+                let cipher = Aes256Gcm::new(cipher_key);
+                let nonce_obj = Nonce::from_slice(&nonce);
+                let ciphertext = cipher.encrypt(nonce_obj, plaintext.as_ref())
+                    .expect("AES-256-GCM encrypt failed");
+
+                blocks_sealed.fetch_add(1, Ordering::Relaxed);
+
+                EncryptedBlock {
+                    block_index,
+                    ephemeral_pub,
+                    nonce,
+                    required_clearance,
+                    plaintext_hash,
+                    ciphertext,
+                    encrypted_at_ns: boot_time.elapsed().as_nanos() as u64,
+                    encrypted_by: encrypted_by.clone(),
+                }
+            })
+            .collect();
+
+        let total_us = t0.elapsed().as_micros() as u64;
+        let total_bytes: usize = plaintexts.iter().map(|p| p.len()).sum();
+        let sealed = blocks_sealed.load(Ordering::Relaxed);
+        let count = blocks.len().max(1);
+
+        // Update stats
+        self.stats.blocks_sealed += sealed;
+        if let Some(ref mut s) = self.session {
+            s.blocks_sealed += sealed;
+        }
+
+        // Cache keys voor snelle open
+        for block in &blocks {
+            let hk = Hkdf::<Sha256>::new(None, &shared_secret);
+            let mut info = Vec::from(HKDF_INFO_PREFIX);
+            info.extend_from_slice(&block.block_index.to_le_bytes());
+            let mut aes_key = [0u8; AES_KEY_SIZE];
+            hk.expand(&info, &mut aes_key).expect("HKDF expand failed");
+            self.key_cache.put(block.ephemeral_pub, block.block_index, aes_key);
+        }
+
+        BatchResult {
+            blocks,
+            total_us,
+            per_block_us: total_us / count as u64,
+            throughput_mbs: (total_bytes as f64) / (total_us.max(1) as f64 / 1_000_000.0) / (1024.0 * 1024.0),
+            threads_used: rayon::current_num_threads(),
+        }
+    }
+
+    /// Parallel open: ontsleutel meerdere blocks met dezelfde JIS claim.
+    /// Gebruikt key cache waar mogelijk, anders parallel DH.
+    /// Stats worden bijgewerkt na afloop.
+    pub fn open_batch(
+        &mut self,
+        blocks: &[EncryptedBlock],
+        claim: &JisClaim,
+    ) -> BatchOpenResult {
+        let t0 = Instant::now();
+        let denied = AtomicU64::new(0);
+        let system_secret = self.system_secret;
+
+        if claim.identity.is_empty() || claim.ed25519_pub.len() != ED25519_PUB_SIZE * 2 {
+            return BatchOpenResult {
+                plaintexts: vec![],
+                denied: blocks.len() as u64,
+                total_us: 0,
+                per_block_us: 0,
+                throughput_mbs: 0.0,
+            };
+        }
+
+        // Pre-fetch cached keys
+        let cached_keys: Vec<Option<[u8; 32]>> = blocks
+            .iter()
+            .map(|b| self.key_cache.get(&b.ephemeral_pub, b.block_index))
+            .collect();
+
+        let results: Vec<Option<Vec<u8>>> = blocks
+            .par_iter()
+            .zip(cached_keys.par_iter())
+            .map(|(block, cached_key)| {
+                // Clearance check
+                if claim.clearance < block.required_clearance {
+                    denied.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+
+                // Key: cache hit of DH
+                let aes_key = if let Some(key) = cached_key {
+                    *key
+                } else {
+                    let sys_static = StaticSecret::from(system_secret);
+                    let eph_pub = PublicKey::from(block.ephemeral_pub);
+                    let shared = sys_static.diffie_hellman(&eph_pub);
+                    let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+                    let mut info = Vec::from(HKDF_INFO_PREFIX);
+                    info.extend_from_slice(&block.block_index.to_le_bytes());
+                    let mut key = [0u8; AES_KEY_SIZE];
+                    hk.expand(&info, &mut key).expect("HKDF expand failed");
+                    key
+                };
+
+                // AES-256-GCM decrypt
+                let cipher_key = Key::<Aes256Gcm>::from_slice(&aes_key);
+                let cipher = Aes256Gcm::new(cipher_key);
+                let nonce = Nonce::from_slice(&block.nonce);
+                let plaintext = cipher.decrypt(nonce, block.ciphertext.as_ref())
+                    .expect("AES-256-GCM decrypt failed");
+
+                // Integrity check
+                let mut hasher = Sha256::new();
+                hasher.update(&plaintext);
+                let hash_result = hasher.finalize();
+                let mut actual_hash = [0u8; 32];
+                actual_hash.copy_from_slice(&hash_result);
+                if actual_hash != block.plaintext_hash {
+                    return None;
+                }
+
+                Some(plaintext)
+            })
+            .collect();
+
+        let plaintexts: Vec<Vec<u8>> = results.into_iter().flatten().collect();
+        let total_us = t0.elapsed().as_micros() as u64;
+        let total_bytes: usize = plaintexts.iter().map(|p| p.len()).sum();
+        let count = blocks.len().max(1);
+
+        // Update stats
+        self.stats.blocks_opened += plaintexts.len() as u64;
+        self.stats.access_denied += denied.load(Ordering::Relaxed);
+
+        BatchOpenResult {
+            plaintexts,
+            denied: denied.load(Ordering::Relaxed),
+            total_us,
+            per_block_us: total_us / count as u64,
+            throughput_mbs: (total_bytes as f64) / (total_us.max(1) as f64 / 1_000_000.0) / (1024.0 * 1024.0),
+        }
     }
 }
 

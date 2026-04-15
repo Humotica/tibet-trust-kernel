@@ -161,11 +161,8 @@ fn main() {
     }
     println!();
 
-    // ── Test 5: Multi-core parallel ──
-    println!("  ── Von Braun Mode (multi-core parallel) ──");
-    let system_secret = b"TIBET-BIFURCATION-SYSTEM-KEY-V01";
-    let mut secret_bytes = [0u8; 32];
-    secret_bytes.copy_from_slice(system_secret);
+    // ── Test 5: Multi-core parallel (session + batch) ──
+    println!("  ── Von Braun Mode (multi-core + session keys) ──");
 
     for &(label, size, count) in &[
         ("4KB", 4096usize, 10_000usize),
@@ -174,17 +171,18 @@ fn main() {
     ] {
         let plaintexts: Vec<Vec<u8>> = (0..count).map(|_| vec![0x42u8; size]).collect();
 
-        // Single
+        // Single-thread session seal
         let mut eng = AirlockBifurcation::new();
         let t0 = Instant::now();
         for (i, pt) in plaintexts.iter().enumerate() {
-            let _ = eng.seal(pt, i, ClearanceLevel::Confidential, "b");
+            let _ = eng.seal_session(pt, i, ClearanceLevel::Confidential, "b");
         }
         let single_mbs = (count as f64 * size as f64) / (t0.elapsed().as_micros() as f64 / 1_000_000.0) / (1024.0 * 1024.0);
 
-        // Multi
-        let result = parallel_seal(&plaintexts, &secret_bytes, ClearanceLevel::Confidential, "b");
-        println!("  {:>5}:    {:>7.1} MB/s single -> {:>7.1} MB/s parallel  ({:.1}x, {} threads)",
+        // Multi-core batch seal (session + parallel)
+        let mut eng = AirlockBifurcation::new();
+        let result = eng.seal_batch(&plaintexts, ClearanceLevel::Confidential, "b");
+        println!("  {:>5}:    {:>7.1} MB/s session -> {:>7.1} MB/s batch  ({:.1}x, {} threads)",
             label, single_mbs, result.throughput_mbs,
             result.throughput_mbs / single_mbs, result.threads_used);
     }
@@ -212,26 +210,34 @@ fn main() {
     }
     println!();
 
-    // ── RDRAND benchmark ──
+    // ── Entropy benchmark ──
+    println!("  ── Entropy Sources ──");
+    let n = 100_000u128;
+
+    if rdseed_available() {
+        let t0 = Instant::now();
+        for _ in 0..n { let _ = rdseed64(); }
+        let rdseed_ns = (t0.elapsed().as_micros() * 1000) / n;
+        println!("  RDSEED:   {} ns/call  (true entropy)", rdseed_ns);
+    }
+
     if rdrand_available() {
-        println!("  ── RDRAND vs OsRng ──");
-        let n = 100_000;
         let t0 = Instant::now();
         for _ in 0..n { let _ = rdrand_nonce(); }
-        let rdrand_ns = (t0.elapsed().as_micros() * 1000) / n as u128;
+        let nonce_ns = (t0.elapsed().as_micros() * 1000) / n;
+        println!("  Nonce:    {} ns/nonce (RDSEED>RDRAND>OsRng auto-select)", nonce_ns);
+    }
 
+    {
         let t0 = Instant::now();
         for _ in 0..n {
             let mut nonce = [0u8; 12];
             rand::Rng::fill(&mut rand::rngs::OsRng, &mut nonce);
         }
-        let osrng_ns = (t0.elapsed().as_micros() * 1000) / n as u128;
-
-        println!("  RDRAND:   {} ns/nonce", rdrand_ns);
-        println!("  OsRng:    {} ns/nonce", osrng_ns);
-        println!("  Speedup:  {:.1}x", osrng_ns as f64 / rdrand_ns.max(1) as f64);
-        println!();
+        let osrng_ns = (t0.elapsed().as_micros() * 1000) / n;
+        println!("  OsRng:    {} ns/nonce (syscall fallback)", osrng_ns);
     }
+    println!();
 
     // Summary
     println!("  ═══════════════════════════════════════════════════════");
