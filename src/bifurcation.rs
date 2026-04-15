@@ -49,6 +49,10 @@ pub fn rdrand_available() -> bool {
 
 /// Genereer 64 bits random via RDRAND instructie.
 /// Retourneert None als RDRAND faalt (retry exhausted).
+/// Op niet-x86_64: altijd None (OsRng fallback via rdrand_nonce).
+#[cfg(not(target_arch = "x86_64"))]
+fn rdrand64() -> Option<u64> { None }
+
 #[cfg(target_arch = "x86_64")]
 fn rdrand64() -> Option<u64> {
     let mut val: u64;
@@ -74,6 +78,10 @@ fn rdrand64() -> Option<u64> {
 /// Genereer 64 bits echte entropy via RDSEED instructie.
 /// RDSEED haalt direct uit de on-die entropy source (trager maar cryptografisch sterker).
 /// Retourneert None als RDSEED faalt of niet beschikbaar.
+/// Op niet-x86_64: altijd None.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn rdseed64() -> Option<u64> { None }
+
 #[cfg(target_arch = "x86_64")]
 pub fn rdseed64() -> Option<u64> {
     if !rdseed_available() {
@@ -99,10 +107,31 @@ pub fn rdseed64() -> Option<u64> {
     None
 }
 
+/// RDSEED snelheidscheck bij init: als RDSEED >5µs per call,
+/// skippen we het in de nonce cascade (te traag voor hot path).
+/// Wordt eenmalig bij eerste aanroep gemeten.
+static RDSEED_FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn rdseed_is_fast() -> bool {
+    *RDSEED_FAST.get_or_init(|| {
+        if !rdseed_available() {
+            return false;
+        }
+        // Meet 10 calls, check of gemiddelde <5µs
+        let t0 = Instant::now();
+        let mut ok = 0u32;
+        for _ in 0..10 {
+            if rdseed64().is_some() { ok += 1; }
+        }
+        let avg_ns = t0.elapsed().as_nanos() / 10;
+        ok >= 8 && avg_ns < 5_000 // minstens 80% success + <5µs
+    })
+}
+
 /// Genereer een nonce via de beste beschikbare hardware entropy.
 ///
 /// Prioriteit:
-///   1. RDSEED (echte entropy, cryptografisch sterkst)
+///   1. RDSEED (echte entropy, alleen als snel genoeg — <5µs per call)
 ///   2. RDRAND (hardware PRNG, 0 syscalls)
 ///   3. OsRng (/dev/urandom fallback)
 pub fn rdrand_nonce() -> [u8; 12] {
@@ -110,8 +139,8 @@ pub fn rdrand_nonce() -> [u8; 12] {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Probeer RDSEED eerst (sterkste entropy)
-        if rdseed_available() {
+        // Probeer RDSEED eerst (alleen als timing check passed)
+        if rdseed_is_fast() {
             if let (Some(a), Some(b)) = (rdseed64(), rdseed64()) {
                 nonce[..8].copy_from_slice(&a.to_le_bytes());
                 nonce[8..].copy_from_slice(&b.to_le_bytes()[..4]);
@@ -1024,49 +1053,58 @@ impl AirlockBifurcation {
         let boot_time = self.boot_time;
         let blocks_sealed = AtomicU64::new(0);
 
-        // Parallel seal met session shared secret
-        let blocks: Vec<EncryptedBlock> = plaintexts
-            .par_iter()
-            .enumerate()
-            .map(|(block_index, plaintext)| {
-                // HKDF per-block key (geen DH!)
-                let hk = Hkdf::<Sha256>::new(None, &shared_secret);
-                let mut info = Vec::from(HKDF_INFO_PREFIX);
-                info.extend_from_slice(&block_index.to_le_bytes());
-                let mut aes_key = [0u8; AES_KEY_SIZE];
-                hk.expand(&info, &mut aes_key).expect("HKDF expand failed");
+        // Von Braun drempel: onder 16KB is rayon overhead groter dan de winst.
+        // In dat geval single-thread, tenzij er genoeg blocks zijn om het waard te maken.
+        let avg_size = if plaintexts.is_empty() { 0 } else {
+            plaintexts.iter().map(|p| p.len()).sum::<usize>() / plaintexts.len()
+        };
+        let use_parallel = avg_size >= 16_384 || plaintexts.len() >= 256;
 
-                // Nonce via RDSEED/RDRAND
-                let nonce = rdrand_nonce();
+        // Seal met session shared secret (parallel of single-thread)
+        let seal_one = |(block_index, plaintext): (usize, &Vec<u8>)| -> EncryptedBlock {
+            // HKDF per-block key (geen DH!)
+            let hk = Hkdf::<Sha256>::new(None, &shared_secret);
+            let mut info = Vec::from(HKDF_INFO_PREFIX);
+            info.extend_from_slice(&block_index.to_le_bytes());
+            let mut aes_key = [0u8; AES_KEY_SIZE];
+            hk.expand(&info, &mut aes_key).expect("HKDF expand failed");
 
-                // SHA-256 plaintext hash
-                let mut hasher = Sha256::new();
-                hasher.update(plaintext);
-                let hash_result = hasher.finalize();
-                let mut plaintext_hash = [0u8; 32];
-                plaintext_hash.copy_from_slice(&hash_result);
+            // Nonce via RDSEED/RDRAND
+            let nonce = rdrand_nonce();
 
-                // AES-256-GCM encrypt
-                let cipher_key = Key::<Aes256Gcm>::from_slice(&aes_key);
-                let cipher = Aes256Gcm::new(cipher_key);
-                let nonce_obj = Nonce::from_slice(&nonce);
-                let ciphertext = cipher.encrypt(nonce_obj, plaintext.as_ref())
-                    .expect("AES-256-GCM encrypt failed");
+            // SHA-256 plaintext hash
+            let mut hasher = Sha256::new();
+            hasher.update(plaintext);
+            let hash_result = hasher.finalize();
+            let mut plaintext_hash = [0u8; 32];
+            plaintext_hash.copy_from_slice(&hash_result);
 
-                blocks_sealed.fetch_add(1, Ordering::Relaxed);
+            // AES-256-GCM encrypt
+            let cipher_key = Key::<Aes256Gcm>::from_slice(&aes_key);
+            let cipher = Aes256Gcm::new(cipher_key);
+            let nonce_obj = Nonce::from_slice(&nonce);
+            let ciphertext = cipher.encrypt(nonce_obj, plaintext.as_ref())
+                .expect("AES-256-GCM encrypt failed");
 
-                EncryptedBlock {
-                    block_index,
-                    ephemeral_pub,
-                    nonce,
-                    required_clearance,
-                    plaintext_hash,
-                    ciphertext,
-                    encrypted_at_ns: boot_time.elapsed().as_nanos() as u64,
-                    encrypted_by: encrypted_by.clone(),
-                }
-            })
-            .collect();
+            blocks_sealed.fetch_add(1, Ordering::Relaxed);
+
+            EncryptedBlock {
+                block_index,
+                ephemeral_pub,
+                nonce,
+                required_clearance,
+                plaintext_hash,
+                ciphertext,
+                encrypted_at_ns: boot_time.elapsed().as_nanos() as u64,
+                encrypted_by: encrypted_by.clone(),
+            }
+        };
+
+        let blocks: Vec<EncryptedBlock> = if use_parallel {
+            plaintexts.par_iter().enumerate().map(seal_one).collect()
+        } else {
+            plaintexts.iter().enumerate().map(seal_one).collect()
+        };
 
         let total_us = t0.elapsed().as_micros() as u64;
         let total_bytes: usize = plaintexts.iter().map(|p| p.len()).sum();

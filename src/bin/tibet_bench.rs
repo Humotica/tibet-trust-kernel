@@ -17,6 +17,12 @@ fn main() {
     println!("  \"In 7 microseconden legt licht 2.1 km af. Wij encrypten een block.\"");
     println!();
 
+    // Platform detectie
+    println!("  ── Platform ──");
+    println!("  Arch:     {}", std::env::consts::ARCH);
+    println!("  OS:       {}", std::env::consts::OS);
+    println!();
+
     // Hardware detectie
     println!("  ── Hardware ──");
     print!("  RDRAND:   ");
@@ -25,6 +31,22 @@ fn main() {
     print!("  RDSEED:   ");
     if rdseed_available() { println!("YES (true entropy)"); }
     else { println!("no"); }
+    print!("  AES-NI:   ");
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ecx: u32;
+        unsafe {
+            std::arch::asm!(
+                "push rbx", "mov eax, 1", "cpuid", "pop rbx",
+                out("ecx") ecx, out("eax") _, out("edx") _,
+                options(nostack),
+            );
+        }
+        if (ecx >> 25) & 1 == 1 { println!("YES (hardware AES)"); }
+        else { println!("no (software AES)"); }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { println!("n/a (niet x86_64)"); }
     print!("  CAT L3:   ");
     match cat_l3_status() {
         CatL3Status::Active { ways_reserved, ways_total, .. } =>
@@ -218,14 +240,16 @@ fn main() {
         let t0 = Instant::now();
         for _ in 0..n { let _ = rdseed64(); }
         let rdseed_ns = (t0.elapsed().as_micros() * 1000) / n;
-        println!("  RDSEED:   {} ns/call  (true entropy)", rdseed_ns);
+        let fast = rdseed_ns < 5_000;
+        println!("  RDSEED:   {} ns/call  (true entropy, {})",
+            rdseed_ns, if fast { "FAST — used in cascade" } else { "SLOW — skipped in cascade" });
     }
 
     if rdrand_available() {
         let t0 = Instant::now();
         for _ in 0..n { let _ = rdrand_nonce(); }
         let nonce_ns = (t0.elapsed().as_micros() * 1000) / n;
-        println!("  Nonce:    {} ns/nonce (RDSEED>RDRAND>OsRng auto-select)", nonce_ns);
+        println!("  Nonce:    {} ns/nonce (auto-select: best available)", nonce_ns);
     }
 
     {
