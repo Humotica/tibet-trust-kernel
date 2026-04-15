@@ -534,6 +534,64 @@ impl KeyCache {
     }
 }
 
+/// Session Key — hergebruik één DH shared secret voor meerdere seals.
+///
+/// Eén X25519 DH per sessie (~76µs), daarna alleen HKDF+AES per block (~5µs).
+/// Veilig omdat HKDF met unieke block_index per block een unieke AES key genereert.
+/// Session roteert automatisch na max_blocks of bij handmatige rotate().
+pub struct SessionKey {
+    /// Het gedeelde geheim (ephemeral_secret × system_pub)
+    shared_secret: [u8; 32],
+    /// De ephemeral public key (wordt opgeslagen in elk block)
+    ephemeral_pub: [u8; 32],
+    /// Aantal blocks versleuteld met deze sessie
+    pub blocks_sealed: u64,
+    /// Maximum blocks voor automatische rotatie
+    max_blocks: u64,
+    /// Tijdstip van aanmaak
+    created_at: Instant,
+    /// Maximum leeftijd voordat rotatie verplicht is
+    max_age: std::time::Duration,
+}
+
+impl SessionKey {
+    /// Maak een nieuwe session key aan (doet de dure DH eenmalig).
+    fn new(system_pub: &[u8; 32], max_blocks: u64, max_age: std::time::Duration) -> Self {
+        let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
+        let ephemeral_pub = PublicKey::from(&ephemeral_secret);
+        let system_pub_key = PublicKey::from(*system_pub);
+        let shared = ephemeral_secret.diffie_hellman(&system_pub_key);
+
+        let mut shared_secret = [0u8; 32];
+        shared_secret.copy_from_slice(shared.as_bytes());
+
+        Self {
+            shared_secret,
+            ephemeral_pub: ephemeral_pub.to_bytes(),
+            blocks_sealed: 0,
+            max_blocks,
+            created_at: Instant::now(),
+            max_age,
+        }
+    }
+
+    /// Check of de sessie nog geldig is (niet te oud, niet te veel blocks).
+    fn is_valid(&self) -> bool {
+        self.blocks_sealed < self.max_blocks && self.created_at.elapsed() < self.max_age
+    }
+
+    /// Derive een per-block AES key uit de session shared secret.
+    fn derive_block_key(&mut self, block_index: usize) -> [u8; AES_KEY_SIZE] {
+        let hk = Hkdf::<Sha256>::new(None, &self.shared_secret);
+        let mut info = Vec::from(HKDF_INFO_PREFIX);
+        info.extend_from_slice(&block_index.to_le_bytes());
+        let mut key = [0u8; AES_KEY_SIZE];
+        hk.expand(&info, &mut key).expect("HKDF expand failed");
+        self.blocks_sealed += 1;
+        key
+    }
+}
+
 /// De Airlock Bifurcatie Engine.
 ///
 /// Verantwoordelijkheden:
@@ -543,6 +601,7 @@ impl KeyCache {
 ///   4. Clearance check: claim.clearance >= block.required_clearance
 ///   5. Audit: elk seal/open genereert een TIBET event
 ///   6. Key cache: hergebruik DH-keys voor herhaalde operaties
+///   7. Session keys: één DH per sessie, ~5µs per seal daarna
 pub struct AirlockBifurcation {
     /// Statistieken
     pub stats: BifurcationStats,
@@ -554,6 +613,8 @@ pub struct AirlockBifurcation {
     boot_time: Instant,
     /// Key cache voor herhaalde DH-operaties (open dezelfde blocks)
     pub key_cache: KeyCache,
+    /// Actieve session key (None = nog niet aangemaakt of verlopen)
+    session: Option<SessionKey>,
 }
 
 impl AirlockBifurcation {
@@ -575,6 +636,7 @@ impl AirlockBifurcation {
             system_pub: system_public.to_bytes(),
             boot_time: Instant::now(),
             key_cache: KeyCache::new(16384), // 16K entries ≈ 1.5MB cache
+            session: None,
         }
     }
 
@@ -645,6 +707,91 @@ impl AirlockBifurcation {
             encrypt_us,
             key_derive_us,
         }
+    }
+
+    /// Seal met session key: hergebruik DH shared secret voor snelle seals.
+    ///
+    /// Eerste call: volledige DH (~76µs) — maakt session aan.
+    /// Volgende calls: alleen HKDF + AES (~5µs) — 15x sneller.
+    /// Session roteert automatisch na 100K blocks of 5 minuten.
+    ///
+    /// Cryptografisch veilig: HKDF met unieke block_index per block
+    /// garandeert unieke AES keys. Zelfde ephemeral_pub in elk block
+    /// van dezelfde sessie — open() werkt identiek.
+    pub fn seal_session(
+        &mut self,
+        plaintext: &[u8],
+        block_index: usize,
+        required_clearance: ClearanceLevel,
+        encrypted_by: &str,
+    ) -> BifurcationResult {
+        let t_key = Instant::now();
+
+        // Session key: hergebruik of maak nieuw
+        let needs_new = self.session.as_ref().map_or(true, |s| !s.is_valid());
+        if needs_new {
+            self.session = Some(SessionKey::new(
+                &self.system_pub,
+                100_000,  // max 100K blocks per sessie
+                std::time::Duration::from_secs(300),  // max 5 minuten
+            ));
+        }
+
+        let session = self.session.as_mut().unwrap();
+
+        // Per-block AES key uit session shared secret (geen DH!)
+        let aes_key = session.derive_block_key(block_index);
+        let ephemeral_pub = session.ephemeral_pub;
+        let key_derive_us = t_key.elapsed().as_micros() as u64;
+
+        // Cache voor open()
+        self.key_cache.put(ephemeral_pub, block_index, aes_key);
+
+        // Nonce via RDRAND
+        let nonce = self.generate_nonce(block_index);
+
+        // SHA256 plaintext hash
+        let plaintext_hash = self.sha256(plaintext);
+
+        // AES-256-GCM encrypt
+        let t_enc = Instant::now();
+        let ciphertext = self.aes_gcm_encrypt(plaintext, &aes_key, &nonce);
+        let encrypt_us = t_enc.elapsed().as_micros() as u64;
+
+        let block = EncryptedBlock {
+            block_index,
+            ephemeral_pub,
+            nonce,
+            required_clearance,
+            plaintext_hash,
+            ciphertext,
+            encrypted_at_ns: self.boot_time.elapsed().as_nanos() as u64,
+            encrypted_by: encrypted_by.to_string(),
+        };
+
+        // Stats
+        self.stats.blocks_sealed += 1;
+        let total = self.stats.blocks_sealed;
+        self.stats.avg_encrypt_us =
+            (self.stats.avg_encrypt_us * (total - 1) + encrypt_us) / total;
+        self.stats.avg_key_derive_us =
+            (self.stats.avg_key_derive_us * (total - 1) + key_derive_us) / total;
+
+        BifurcationResult::Sealed {
+            block,
+            encrypt_us,
+            key_derive_us,
+        }
+    }
+
+    /// Forceer sessie rotatie (bij security event of key rotation).
+    pub fn rotate_session(&mut self) {
+        self.session = None;
+    }
+
+    /// Geeft het aantal blocks versleuteld in de huidige sessie.
+    pub fn session_blocks(&self) -> u64 {
+        self.session.as_ref().map_or(0, |s| s.blocks_sealed)
     }
 
     /// Open: ontsleutel een block met een geldige JIS claim (decrypt-on-read).

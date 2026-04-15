@@ -483,9 +483,96 @@ fn main() {
         println!();
     }
 
+    // ── Part 10: Session Key — DH Elimination voor Seal ──
+    {
+        println!("── Part 10: Session Key — DH Elimination voor Seal ──");
+        let claim = make_test_claim(ClearanceLevel::TopSecret);
+        let data = vec![0x42u8; 4096];
+        let iterations = 10_000;
+
+        // Regular seal (volledige DH per block)
+        let mut engine_regular = AirlockBifurcation::new();
+        let t0 = Instant::now();
+        for i in 0..iterations {
+            let _ = engine_regular.seal(&data, i, ClearanceLevel::Confidential, "bench");
+        }
+        let regular_us = t0.elapsed().as_micros();
+        let regular_per = regular_us / iterations as u128;
+        let regular_mbs = (iterations as f64 * 4096.0) / (regular_us as f64 / 1_000_000.0) / (1024.0 * 1024.0);
+
+        // Session seal (één DH, daarna alleen HKDF+AES)
+        let mut engine_session = AirlockBifurcation::new();
+        let t0 = Instant::now();
+        for i in 0..iterations {
+            let _ = engine_session.seal_session(&data, i, ClearanceLevel::Confidential, "bench");
+        }
+        let session_us = t0.elapsed().as_micros();
+        let session_per = session_us / iterations as u128;
+        let session_mbs = (iterations as f64 * 4096.0) / (session_us as f64 / 1_000_000.0) / (1024.0 * 1024.0);
+
+        let speedup = regular_per as f64 / session_per.max(1) as f64;
+
+        println!("  {} seals × 4KB:", iterations);
+        println!("    Regular seal:  {:>6} µs/seal  ({:>7.1} MB/s)  [full DH per block]",
+            regular_per, regular_mbs);
+        println!("    Session seal:  {:>6} µs/seal  ({:>7.1} MB/s)  [cached DH]",
+            session_per, session_mbs);
+        println!("    ⚡ Speedup:     {:.1}x", speedup);
+        println!("    Session blocks: {}", engine_session.session_blocks());
+
+        // Roundtrip verify: session-sealed blocks moeten openbaar zijn
+        println!("\n  Roundtrip verify (session sealed → open):");
+        let mut engine = AirlockBifurcation::new();
+        let test_sizes = [64, 4096, 65536, 1048576];
+        for &size in &test_sizes {
+            let test_data = vec![0xABu8; size];
+            let block = if let BifurcationResult::Sealed { block, .. } =
+                engine.seal_session(&test_data, size, ClearanceLevel::Confidential, "test")
+            {
+                block
+            } else {
+                println!("    ✗ {}B seal failed", size);
+                continue;
+            };
+
+            match engine.open(&block, &claim) {
+                BifurcationResult::Opened { plaintext, .. } => {
+                    if plaintext == test_data {
+                        println!("    ✓ {}B roundtrip OK", size);
+                    } else {
+                        println!("    ✗ {}B DATA MISMATCH", size);
+                    }
+                }
+                other => println!("    ✗ {}B: {:?}", size, other),
+            }
+        }
+
+        // Throughput scaling met session keys
+        println!("\n  Session throughput scaling:");
+        let mut engine = AirlockBifurcation::new();
+        for &size in &[1024, 4096, 16384, 65536, 262144, 1048576] {
+            let data = vec![0x42u8; size];
+            let iters = if size >= 262144 { 100 } else { 1000 };
+
+            let t0 = Instant::now();
+            for i in 0..iters {
+                let _ = engine.seal_session(&data, i, ClearanceLevel::Unclassified, "bench");
+            }
+            let total_us = t0.elapsed().as_micros();
+            let per_seal = total_us / iters as u128;
+            let throughput = (iters as f64 * size as f64) / (total_us as f64 / 1_000_000.0) / (1024.0 * 1024.0);
+
+            println!("    {:>7}: {:>6} µs/seal  {:>8.1} MB/s",
+                format!("{}KB", size / 1024),
+                per_seal,
+                throughput);
+        }
+        println!();
+    }
+
     println!("═══════════════════════════════════════════════════════════");
     println!("  Airlock Bifurcatie v2: encrypt-by-default WERKT.");
     println!("  Geen JIS = dood materiaal. Identity IS the key.");
-    println!("  Von Braun Mode: multi-core parallel sealing.");
+    println!("  Von Braun Mode: multi-core + session keys.");
     println!("═══════════════════════════════════════════════════════════");
 }
