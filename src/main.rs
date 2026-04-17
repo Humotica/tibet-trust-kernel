@@ -1,33 +1,14 @@
-mod mux;
-mod airlock_vmm;
-mod snaft;
-mod tibet_token;
-mod config;
-mod bus;
-mod watchdog;
-mod voorproever;
-mod archivaris;
-mod portmux;
-mod xdp;
-mod seccomp;
-mod zandbak;
-mod snapshot;
-mod recovery;
-mod git_store;
-mod upip_pager;
-mod ram_raid;
-mod bifurcation;
-
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::bus::VirtualBus;
-use crate::config::TrustKernelConfig;
-use crate::mux::start_mux_listener;
-use crate::voorproever::{Voorproever, VoorproeverVerdict};
-use crate::archivaris::{Archivaris, ArchivarisResult};
-use crate::tibet_token::TibetProvenance;
-use crate::watchdog::{Watchdog, WatchdogEvent};
+use tibet_trust_kernel::bus::VirtualBus;
+use tibet_trust_kernel::config::TrustKernelConfig;
+use tibet_trust_kernel::mux::{self, start_mux_listener};
+use tibet_trust_kernel::voorproever::{Voorproever, VoorproeverVerdict};
+use tibet_trust_kernel::archivaris::{Archivaris, ArchivarisResult};
+use tibet_trust_kernel::tibet_token::TibetProvenance;
+use tibet_trust_kernel::watchdog::{Watchdog, WatchdogEvent};
+use tibet_trust_kernel::snaft;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -132,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("◈   ✗ {}", v);
                     }
 
-                    let decision = crate::snaft::Decision {
+                    let decision = snaft::Decision {
                         is_safe: false,
                         reason: reason.clone(),
                         violations: violations.clone(),
