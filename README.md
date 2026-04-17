@@ -1,18 +1,29 @@
 # tibet-trust-kernel
 
-Zero-trust security foundation for AI infrastructure. AES-256-GCM encryption, cryptographic integrity verification, and cross-machine memory transport — every byte proven, every execution isolated.
+Zero-trust security foundation. AES-256-GCM encryption, cryptographic integrity verification, sandboxed execution, and cross-machine memory transport — every byte proven, every execution isolated.
 
 ## What it does
 
-tibet-trust-kernel provides the security primitives that AI systems need to operate in zero-trust environments:
+tibet-trust-kernel provides security primitives for any system that needs zero-trust guarantees — encrypted data at rest, verified transport, isolated execution. It works for databases, IoT devices, financial systems, AI infrastructure, or anything where you can't afford to trust the network or the host.
 
-- **Bifurcation** — AES-256-GCM encrypt/decrypt with X25519 key exchange. Data at rest is always encrypted.
+- **Bifurcation** — AES-256-GCM encrypt/decrypt with X25519 key exchange. Data at rest is always encrypted. Think ransomware model flipped: everything encrypted by default, access requires cryptographic proof (JIS claim).
 - **Airlock** — Sandboxed execution with SNAFT syscall monitoring. Kill or Safe, no middle ground.
 - **ClusterMux** — Persistent multiplexed TCP transport with streaming SHA-256 integrity verification.
 - **Hash Cache** — Skip SHA-256 on previously verified blocks. 14x speedup, zero trust compromise.
-- **DIME Aperture** — Virtual memory mapping for large datasets across machines (used by [tibet-dgx](https://github.com/Humotica/tibet-dgx) for LLM inference).
+- **DIME Aperture** — Virtual memory mapping for large datasets across machines. Blocks materialize on-demand via page faults.
 - **RAM RAID-0** — Stripe data across machines with userfaultfd page fault handling.
 - **UPIP Pager** — Crypto-safe application-level paging with fork tokens for cross-device continuation.
+
+### Use cases
+
+| Domain | How trust-kernel helps |
+|--------|----------------------|
+| **Financial systems** | Bifurcation encrypts transactions at rest, triage levels gate approvals |
+| **IoT / Edge** | ClusterMux transports sensor data with SHA-256 integrity, even over unreliable links |
+| **Databases** | RAM RAID-0 stripes hot data across nodes, hash cache avoids re-verification |
+| **AI inference** | [tibet-dgx](https://github.com/Humotica/tibet-dgx) uses DIME Aperture to map LLM weights across machines |
+| **Multi-device apps** | UPIP fork tokens seal a session on one device, resume on another |
+| **Compliance (EU AI Act, NIS2)** | Every operation produces a TIBET provenance token — cryptographic audit trail |
 
 ## Install
 
