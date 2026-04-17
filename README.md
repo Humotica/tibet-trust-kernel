@@ -1,71 +1,89 @@
-# tibet-airlock
+# tibet-trust-kernel
 
-Zero-trust microVM sandbox with TIBET provenance. Kernel isolation in <1ms, cryptographic proof of every execution.
+Zero-Trust DGX — Cross-machine AI memory virtualization. Run LLMs larger than your RAM by transparently mapping model blocks across servers via userfaultfd + encrypted RAID-0. No NVLink required.
 
 ## What it does
 
-Tibet-airlock receives an **intent** (what the AI agent wants to do), boots a pre-warmed microVM snapshot, executes the payload under **SNAFT syscall monitoring**, and returns a **TIBET provenance token** — cryptographic proof of exactly what happened.
+Maps AI model memory across multiple machines using the **DIME Aperture** pattern (inspired by 3dfx Voodoo AGP texture aperture). Blocks start as unmapped spaceholders, materialize on-demand via page faults, and stream over TCP with SHA-256 integrity + AES-256-GCM encryption.
 
 ```
-Intent → Snapshot Wake (<0.01ms) → SNAFT Monitor → Triage → TIBET Token
+Page fault → MUX fetch from RAM B → SHA-256 verify → uffd.copy() → block resident
+2nd+ access → hash cache hit → SHA-256 skipped → 14x faster
 ```
 
-## Why
+## Hardware-tested performance
 
-AI agents execute code. That code needs isolation. Not "container isolation" — **kernel isolation**. Every syscall monitored. Every execution proven. Every violation killed instantly.
+Tested with real Qwen 2.5 7B model (4.36GB) over P520 (64GB) ↔ DL360 (64GB) direct 10Gbps:
 
-- **Sub-milliseconde** — 0.6ms average roundtrip including TCP
-- **Intent-based routing** — each intent maps to a specific OCI image and snapshot
-- **SNAFT syscall monitoring** — allowlist per intent + always-dangerous blocklist
-- **TIBET provenance** — every execution generates a cryptographic proof token
-- **Kill or Safe** — violations terminate the VM immediately, no second chances
+| Metric | Result |
+|--------|--------|
+| Ping RTT (10Gbps direct) | 0.17ms |
+| Store to RAM B | 33 MB/s (sequential) |
+| Restore + Verify | 112 MB/s |
+| Hash cache hit rate | 100% |
+| SHA-256 bytes saved | 2.4 GB |
+| Block integrity | 2234/2234 verified |
+
+Combined RAM: 128GB — a 70B Q4_K_M model (40GB) fits entirely.
 
 ## Quick start
 
+```rust
+// Cargo.toml
+tibet-trust-kernel = { version = "1.0.0-alpha", features = ["llm"] }
+```
+
 ```bash
-cargo install tibet-airlock
-tibet-airlock  # starts MUX listener on 127.0.0.1:4430
+# Server (DL360 — RAM B provider)
+ram-raid-cluster-demo server 0.0.0.0:4432
+
+# Client (P520 — runs inference)
+ram-raid-cluster-demo client 10.0.100.1:4432
+
+# LLM Mapper demo
+llm-mapper-demo quick    # 48MB simulation
+llm-mapper-demo 70b      # 40GB aperture map
+
+# Real GGUF model test
+gguf-raid-test /path/to/model.gguf 10.0.100.1:4432
 ```
-
-Send a MUX frame (JSON over TCP):
-
-```json
-{
-    "channel_id": 1,
-    "intent": "code:execute",
-    "from_aint": "your_agent.aint",
-    "payload": "print('hello world')"
-}
-```
-
-Safe execution returns status 200 + TIBET success token.
-Dangerous payload returns status 403 + TIBET incident token with violations.
-Unknown intent returns status 400 + TIBET rejection token.
-
-## Supported intents
-
-| Intent | OCI Image | Snapshot |
-|--------|-----------|----------|
-| `analyze_malware_sample` | airlock-python | python-safe-boot |
-| `code:execute` | airlock-python | python-safe-boot |
-| `file:scan` | airlock-scanner | scanner-ready |
-| `call:voice:*` | airlock-sip | sip-ready |
-| `call:video:*` | airlock-webrtc | webrtc-ready |
-
-## SNAFT blocked syscalls
-
-Always dangerous (any intent): `sys_ptrace`, `sys_socket`, `sys_connect`, `sys_dlopen`, `sys_fork`, `sys_clone`, `sys_mount`, `sys_reboot`, `sys_kexec_load`
 
 ## Features
 
-- `simulation` (default) — simulated VM for testing without /dev/kvm
-- `kvm` — real Ignition KVM isolation via [lttle.cloud](https://lttle.cloud)
+```toml
+tibet-trust-kernel = { version = "1.0", features = ["cluster"] }   # Cross-machine RAM
+tibet-trust-kernel = { version = "1.0", features = ["llm"] }       # LLM Memory Mapper
+tibet-trust-kernel = { version = "1.0", features = ["full"] }      # Everything
+```
+
+- `cluster` — Cross-machine RAM RAID-0 + ClusterMux transport
+- `llm` — LLM Memory Mapper (DIME aperture), implies cluster
+- `simulation` (default) — Simulated KVM for testing
+- `kvm` — Real Ignition KVM isolation
+
+## Modules
+
+| Module | Description | Tests |
+|--------|-------------|-------|
+| `cluster_transport` | TCP-per-block transport, BlockStore | 9 |
+| `cluster_mux` | Persistent MUX, streaming SHA-256, hash cache | 8 |
+| `llm_mapper` | DIME Aperture, model manifests, prefetch | 11 |
+| `ram_raid` | RAID-0 striping, batch restore, uffd | - |
+| `bifurcation` | AES-256-GCM seal/open, X25519 key exchange | 5 |
+
+## Key concepts
+
+- **DIME Aperture**: Virtual address space where all model blocks exist as spaceholders. On first access, the block materializes from the remote machine. Like a 3dfx Voodoo AGP texture aperture, but for AI model weights.
+
+- **Hash Cache**: After first SHA-256 verification, the hash is cached. Subsequent loads skip SHA-256 entirely — 14x speedup on repeat access. Store pre-warms the cache (zero misses ever).
+
+- **RAID-0 Striping**: Even blocks stay local (RAM A), odd blocks go remote (RAM B). Combined RAM of both machines available for model loading.
+
+- **Prefetch**: During inference, while processing layer N, layers N+1..N+4 are prefetched in the background. 21/24 layers hit prefetch cache.
 
 ## Part of TIBET
 
-Tibet-airlock is part of the [TIBET ecosystem](https://pypi.org/project/tibet/) — Traceable Intent-Based Event Tokens. Install the full stack: `pip install tibet[full]`
-
-Built by [Humotica](https://humotica.com) for the [AInternet](https://ainternet.org).
+tibet-trust-kernel is part of the [TIBET ecosystem](https://pypi.org/project/tibet/) — Traceable Intent-Based Event Tokens. Built by [Humotica](https://humotica.com) for the [AInternet](https://ainternet.org).
 
 ## License
 
