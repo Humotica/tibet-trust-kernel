@@ -21,9 +21,12 @@ features = ["kvm"]
 #   ignition = { git = "https://github.com/nicholasgasior/ignition" }
 
 [features]
-default = ["simulation"]
+default = ["simulation", "cluster", "llm"]
 simulation = []                    # Simulated KVM — for testing without hardware
-kvm = []                           # Real Ignition KVM — requires /dev/kvm + ignition crate
+kvm = []                           # Real Ignition KVM — requires /dev/kvm
+cluster = []                       # Cross-machine RAM RAID-0 + ClusterMux transport
+llm = ["cluster"]                  # LLM Memory Mapper (DIME aperture) — implies cluster
+full = ["cluster", "llm"]          # All features
 
 [dependencies]
 userfaultfd = "0.8.1"
