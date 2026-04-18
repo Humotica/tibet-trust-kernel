@@ -32,4 +32,6 @@ pub mod ram_raid;
 pub mod upip_pager;
 pub mod cluster_transport;
 pub mod cluster_mux;
+#[cfg(feature = "quic")]
+pub mod quic_mux;
 pub mod llm_mapper;

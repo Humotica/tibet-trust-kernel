@@ -1,6 +1,6 @@
 [package]
 name = "tibet-trust-kernel"
-version = "1.0.0-alpha.2"
+version = "1.0.0-alpha.3"
 edition = "2021"
 description = "Zero-trust security foundation — AES-256-GCM encryption, SHA-256 integrity, sandboxed execution, cross-machine memory transport. For finance, IoT, AI, databases, anything zero-trust."
 license = "MIT"
@@ -25,8 +25,9 @@ default = ["simulation", "cluster", "llm"]
 simulation = []                    # Simulated KVM — for testing without hardware
 kvm = []                           # Real Ignition KVM — requires /dev/kvm
 cluster = []                       # Cross-machine RAM RAID-0 + ClusterMux transport
+quic = ["cluster", "dep:quinn", "dep:rustls", "dep:rcgen"]  # QUIC transport — multi-stream, 0-RTT
 llm = ["cluster"]                  # LLM Memory Mapper (DIME aperture) — implies cluster
-full = ["cluster", "llm"]          # All features
+full = ["cluster", "llm", "quic"]  # All features
 
 [dependencies]
 userfaultfd = "0.8.1"
@@ -43,6 +44,11 @@ sha2 = "0.10"               # SHA-256
 hkdf = "0.12"               # HKDF-SHA256 per-block key derivation
 rand = "0.8"                # OsRng voor nonces en ephemeral keys
 rayon = "1.10"              # Multi-core parallel sealing/opening
+
+# QUIC transport — no head-of-line blocking, multi-stream, 0-RTT
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", optional = true }  # Self-signed certs for internal links
 
 # Real KVM backend — when ignition is published to crates.io:
 # ignition = { version = "0.1", optional = true }
